@@ -1,0 +1,7 @@
+[package]
+name = "spend_vault_example"
+edition = "2024"
+
+[addresses]
+openzeppelin_allowance = "0x0"
+spend_vault_example = "0x0"
