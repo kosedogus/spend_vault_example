@@ -116,12 +116,12 @@ public struct Allowance has store, drop {
 
 // === Events ===
 
-// One event per state change, fixed schema. Two deliberate non-emitters:
-// `share` (platform-visible) and `delete_cap` (no vault context; deletion
-// is visible in tx effects). `destroy`'s drain loop emits NO per-entry
+// One event per state change, fixed schema. The one deliberate non-emitter
+// is `share` (platform-visible). `destroy`'s drain loop emits NO per-entry
 // `Revoked`: one `VaultDestroyed` is the terminal event for every entry
 // under that vault_id. All events carry phantom `U` for type-filtered
-// indexing.
+// indexing EXCEPT `CapDeleted`, which is non-generic (`delete_cap` has no
+// coin type in scope).
 
 /// Emitted by `new`. `owner_cap_id` is the vault-to-cap discovery anchor:
 /// indexers resolve current owner custody by following object-ownership
@@ -213,6 +213,16 @@ public struct VaultDestroyed<phantom U> has copy, drop {
     vault_id: ID,
     refunded: u64,
     by: address,
+}
+
+/// Emitted by `delete_cap`. The only non-generic event: `delete_cap`
+/// consumes a bare `SpenderCap` (no coin type in scope), so indexers map
+/// `vault_id` to `U` from the `VaultCreated`/`SpenderCapMinted` they saw.
+/// Lets event-only indexers follow a cap deletion; without it, deleting a
+/// live cap would leave its stranded entry looking like live authority.
+public struct CapDeleted has copy, drop {
+    vault_id: ID,
+    cap_id: ID,
 }
 
 // === Public Functions ===
@@ -615,9 +625,10 @@ public fun spend<U>(
 /// state (absent, suspended, expired, unlimited) can make it abort: the
 /// kill-switch cannot be raced into failure.
 ///
-/// NOT retroactive: revocation takes effect from its consensus sequencing
-/// point; a spend sequenced first still succeeds. Emergency response is
-/// `revoke + withdraw_all` in ONE PTB; neither alone suffices.
+/// NOT retroactive: a spend sequenced before the owner's tx still
+/// succeeds (true of `withdraw_all` too). Pair `revoke` (durably kills the
+/// cap) with `withdraw_all` (sweeps funds, but reversible by permissionless
+/// deposit) for emergencies.
 ///
 /// The cap OBJECT survives in its holder's wallet as inert non-authority:
 /// subsequent spends abort `ENoAllowance`; the holder disposes of it via
@@ -680,8 +691,8 @@ public fun renounce<U>(v: &mut Vault<U>, cap: SpenderCap, ctx: &TxContext) {
 
 /// Vault-less cap destructor: for caps orphaned by `destroy` (`renounce`
 /// needs `&mut Vault`, which no longer exists). Total: never aborts,
-/// touches no vault state, deletes exactly the cap's UID. No event:
-/// deletion is visible in tx effects.
+/// touches no vault state, deletes exactly the cap's UID. Emits
+/// `CapDeleted` so event-only indexers can follow the deletion.
 ///
 /// **Prefer `renounce` if the vault is alive; use `delete_cap` only when
 /// renounce is impossible because the vault is gone.** Deleting a cap whose
@@ -690,8 +701,11 @@ public fun renounce<U>(v: &mut Vault<U>, cap: SpenderCap, ctx: &TxContext) {
 /// `revoke`, and you forfeit the entry's storage rebate that `renounce`
 /// would have recovered.
 public fun delete_cap(cap: SpenderCap) {
-    let SpenderCap { id, vault_id: _ } = cap;
+    let SpenderCap { id, vault_id } = cap;
+    let cap_id = id.to_inner();
     id.delete();
+
+    event::emit(CapDeleted { vault_id, cap_id });
 }
 
 // === Owner Exit ===
