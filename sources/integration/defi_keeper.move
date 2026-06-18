@@ -1,36 +1,35 @@
-/// Integration example: a keeper service that custodies user `SpenderCap`s.
+/// Integration example: a keeper service that custodies user `SpenderCap`s and
+/// spends from their vaults on their behalf.
 ///
-/// This is the library's PRIMARY use case: a protocol holds a user's cap
-/// and spends from the user's vault on the user's behalf, within the budget
-/// and expiry the user's vault owner set.
+/// This is the library's primary use case: a protocol holds a user's cap and
+/// draws from the user's vault, within the per-coin budget and expiry the vault
+/// owner set, without the owner having to send the transaction. The service is
+/// untyped and `execute_topup<T>` is generic, so one custodied cap can be driven
+/// for every coin the owner budgeted it for.
 ///
 /// #### The flow an integrator must get right
 ///
-/// 1. The OPERATOR creates a `Service<U>` pinned to exactly ONE vault ID and
-///    shares it. Pinning up front is what makes step 2's check meaningful.
-/// 2. A user mints a cap against their vault (`mint_cap` returns it by
-///    value) and hands it into custody via `register`. `register` validates
-///    the cap's vault binding (`spender_cap_vault_id`) BEFORE accepting:
-///    a cap bound to some other vault would sit in custody and fail every
-///    spend with `EWrongVault`, or meter a vault this service never agreed
-///    to serve.
-/// 3. The operator calls `execute_topup`, which borrows the custodied cap
-///    and draws from the user's vault. **This function is sender-gated.**
-///    A `SpenderCap` is a bearer instrument: whoever gets the library to
-///    see `&SpenderCap` exercises its full authority. An UNGATED public
-///    function that borrows a custodied cap is world-drainable authority,
-///    so the gate below is not optional hygiene, it is the integration's
-///    security boundary.
-/// 4. The user reclaims their cap any time with `unregister`.
+/// 1. Create a `Service` pinned to exactly ONE vault ID and share it. Pinning up
+///    front is what makes the step-2 check meaningful.
+/// 2. The user mints a cap (`mint_cap` returns it by value) and hands it into
+///    custody via `register`. `register` validates the cap's vault binding
+///    (`spender_cap_vault_id`) BEFORE accepting it: this is the custody-boundary
+///    rule for any protocol that takes a `SpenderCap`.
+/// 3. The operator calls `execute_topup<T>` to draw coin `T`. **This is
+///    sender-gated, and the gate is the point of this module:** a `SpenderCap` is
+///    a bearer instrument, so any code that gets the library to see `&cap`
+///    exercises its full authority. An ungated public function that borrows a
+///    custodied cap is world-drainable, so the operator check is the
+///    integration's security boundary, not optional hygiene.
+/// 4. The user reclaims the cap any time with `unregister`.
 ///
-/// What the vault owner keeps throughout: full control. They can raise,
-/// lower, suspend (`set_allowance`), or kill (`revoke`) the grant while the
-/// cap sits embedded here. The cap object and its ID never change across
-/// owner updates, so registration survives unlimited `set_allowance` calls
-/// and is never repeated.
+/// The vault owner keeps full control throughout: raising, lowering, suspending,
+/// or revoking the grant (`set_allowance` / `revoke` / `revoke_all`) never
+/// changes the cap object, so a cap embedded here keeps working and is never
+/// re-registered.
 module spend_vault_example::defi_keeper;
 
-use openzeppelin_allowance::spend_vault::{Self, Vault, SpenderCap};
+use openzeppelin_allowance::spend_vault::{Vault, SpenderCap};
 use sui::balance::Balance;
 use sui::clock::Clock;
 use sui::table::{Self, Table};
@@ -48,9 +47,9 @@ const ENotRegistered: u64 = 2;
 
 // === Structs ===
 
-/// Shared keeper service. Serves exactly one `Vault<U>`; custodies at most
-/// one cap per user address.
-public struct Service<phantom U> has key {
+/// Shared keeper service. Serves exactly one `Vault` and custodies at most one
+/// cap per user. Untyped, so one service drives every coin a cap is budgeted for.
+public struct Service has key {
     id: UID,
     operator: address,
     vault_id: ID,
@@ -60,10 +59,10 @@ public struct Service<phantom U> has key {
 // === Public Functions ===
 
 /// Create and share a service pinned to `vault_id`. The creator becomes the
-/// operator, the only address the cap-borrowing entrypoint accepts.
-/// Returns the service's object ID so callers can address the shared object.
-public fun create<U>(vault_id: ID, ctx: &mut TxContext): ID {
-    let service = Service<U> {
+/// operator, the only address the cap-borrowing entrypoint accepts. Returns the
+/// service's object ID so callers can address the shared object.
+public fun create(vault_id: ID, ctx: &mut TxContext): ID {
+    let service = Service {
         id: object::new(ctx),
         operator: ctx.sender(),
         vault_id,
@@ -76,38 +75,40 @@ public fun create<U>(vault_id: ID, ctx: &mut TxContext): ID {
 
 /// Hand a cap into the service's custody, keyed by the registering sender.
 ///
-/// The binding check is the custody-boundary rule for ANY protocol that
-/// accepts a `SpenderCap`: validate `spender_cap_vault_id` against the
-/// vault you intend to spend from, on-chain, before taking the cap.
-public fun register<U>(s: &mut Service<U>, cap: SpenderCap, ctx: &TxContext) {
+/// The binding check is the custody-boundary rule for ANY protocol that accepts
+/// a `SpenderCap`: validate `spender_cap_vault_id` against the vault you intend
+/// to spend from, on-chain, before taking the cap.
+public fun register(s: &mut Service, cap: SpenderCap, ctx: &TxContext) {
     assert!(cap.spender_cap_vault_id() == s.vault_id, EWrongVaultForService);
     s.caps.add(ctx.sender(), cap);
 }
 
-/// Draw `amount` from `user`'s vault allowance and return the funds for the
-/// caller to route (deposit into a position, convert to `Coin`, ...).
+/// Draw `amount` of coin `T` from `user`'s allowance and return the funds for the
+/// caller to route (into a position, a `Coin`, ...). Generic over `T`, so the
+/// same custodied cap serves every coin the owner budgeted it for; asking for a
+/// coin the owner never granted aborts inside the library (`ENoAllowance`), so
+/// this fails safe.
 ///
-/// SENDER-GATED: the assert below is the whole point of this module. The
-/// library itself never checks who calls `spend` (any holder of `&cap` has
-/// full authority), so the custody layer must decide who may borrow the cap.
-public fun execute_topup<U>(
-    s: &mut Service<U>,
-    v: &mut Vault<U>,
+/// SENDER-GATED: the operator check below is the security boundary. The library
+/// never checks who calls `spend`, so the custody layer must.
+public fun execute_topup<T>(
+    s: &mut Service,
+    v: &mut Vault,
     user: address,
     amount: u64,
     clock: &Clock,
     ctx: &TxContext,
-): Balance<U> {
+): Balance<T> {
     assert!(ctx.sender() == s.operator, ENotOperator);
     assert!(s.caps.contains(user), ENotRegistered);
 
     let cap = s.caps.borrow(user);
-    spend_vault::spend(v, cap, amount, clock, ctx)
+    v.spend<T>(cap, amount, clock, ctx)
 }
 
-/// Take your cap back. The ledger entry is untouched: the grant stays live
-/// in the vault; only custody of the cap changes hands.
-public fun unregister<U>(s: &mut Service<U>, ctx: &TxContext): SpenderCap {
+/// Take a cap back out of custody. The grant is untouched: it stays live in the
+/// vault; only custody of the cap changes hands.
+public fun unregister(s: &mut Service, ctx: &TxContext): SpenderCap {
     assert!(s.caps.contains(ctx.sender()), ENotRegistered);
     s.caps.remove(ctx.sender())
 }
@@ -115,11 +116,11 @@ public fun unregister<U>(s: &mut Service<U>, ctx: &TxContext): SpenderCap {
 // === Reads ===
 
 /// The vault this service is pinned to.
-public fun vault_id<U>(s: &Service<U>): ID {
+public fun vault_id(s: &Service): ID {
     s.vault_id
 }
 
 /// Whether `user` currently has a cap in custody.
-public fun is_registered<U>(s: &Service<U>, user: address): bool {
+public fun is_registered(s: &Service, user: address): bool {
     s.caps.contains(user)
 }
